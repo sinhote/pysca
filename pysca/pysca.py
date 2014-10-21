@@ -768,6 +768,13 @@ def __clear_all():
 
 
 def connect(portname, timeout=None):
+        """ 
+        Initialize the library.
+
+        Arguments:
+           * portname: The path to the serial port to where the Visca device(s) are connected.
+           * timeout: (Optional) An optional read timeout. 
+        """
 
         global __timeout
         global __serialport
