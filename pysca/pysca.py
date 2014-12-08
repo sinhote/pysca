@@ -1251,9 +1251,10 @@ def reset_memory(device, position):
 
         The second paramenter indicates the memory position to be reset.
         """
+        position = int(position)
 
         if position not in range(MAX_MEMORY_POSITIONS):
-                raise ValueError("Invalid memory position")
+                raise ValueError("Invalid memory position: {}".format(position))
 
         __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RESET, position)
 
@@ -1264,9 +1265,10 @@ def set_memory(device, position):
 
         The second paramenter indicates the memory position to be set.
         """
+        position = int(position)
 
         if position not in range(MAX_MEMORY_POSITIONS):
-                raise ValueError("Invalid memory position")
+                raise ValueError("Invalid memory position: {}".format(position))
 
         __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_SET, position)
 
@@ -1278,9 +1280,10 @@ def recall_memory(device, position):
 
         The second paramenter indicates the memory position to be recalled.
         """
+        position = int(position)
 
         if position not in range(MAX_MEMORY_POSITIONS):
-                raise ValueError("Invalid memory position")
+                raise ValueError("Invalid memory position: {}".format(position))
 
         __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RECALL, position)
 
