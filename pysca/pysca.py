@@ -178,6 +178,42 @@ VISCA_BGAIN_UP=0x02
 VISCA_BGAIN_DOWN=0x03
 VISCA_BGAIN_VALUE=0x44
 
+VISCA_AUTO_EXPOSURE=0x39
+VISCA_AUTO_EXPOSURE_FULL_AUTO=0x00
+VISCA_AUTO_EXPOSURE_MANUAL=0x03
+VISCA_AUTO_EXPOSURE_SHUTTER_PRIORITY=0x0A
+VISCA_AUTO_EXPOSURE_IRIS_PRIORITY=0x0B
+VISCA_AUTO_EXPOSURE_BRIGHT=0x0D
+
+AUTO_EXPOSURE_FULL_AUTO_MODE='auto'
+AUTO_EXPOSURE_MANUAL_MODE='manual'
+AUTO_EXPOSURE_SHUTTER_PRIORITY_MODE='shutter'
+AUTO_EXPOSURE_IRIS_PRIORITY_MODE='iris'
+AUTO_EXPOSURE_BRIGHT_MODE='bright'
+
+VISCA_BRIGHT=0x0D
+VISCA_BRIGHT_UP=0x02
+VISCA_BRIGHT_DOWN=0x03
+VISCA_BRIGHT_VALUE=0x4D
+
+BRIGHT_ACTION_UP='up'
+BRIGHT_ACTION_DOWN='down'
+
+VISCA_EXPOSURE_COMP=0x3E
+VISCA_EXPOSURE_COMP_ON=0x02
+VISCA_EXPOSURE_COMP_OFF=0x03
+VISCA_EXPOSURE_COMP_AMOUNT=0x0E
+VISCA_EXPOSURE_COMP_RESET=0x00
+VISCA_EXPOSURE_COMP_UP=0x02
+VISCA_EXPOSURE_COMP_DOWN=0x03
+VISCA_EXPOSURE_COMP_VALUE=0x4E
+
+EXPOSURE_COMP_ACTION_ON='on'
+EXPOSURE_COMP_ACTION_OFF='off'
+EXPOSURE_COMP_ACTION_RESET='reset'
+EXPOSURE_COMP_ACTION_UP='up'
+EXPOSURE_COMP_ACTION_DOWN='down'
+
 VISCA_MEMORY=0x3F
 VISCA_MEMORY_RESET=0x00
 VISCA_MEMORY_SET=0x01
@@ -1241,6 +1277,74 @@ def set_red_gain(device, action):
 
 def set_blue_gain(device, action):
         raise NotImplementedError()
+
+
+def set_ae_mode(device, mode):
+        """
+        Set the auto exposure mode.
+
+        Possible modes are: 'auto', 'manual', 'shutter', 'iris', 'bright'.
+
+        Please check your device's manual for details.
+        """
+        modes2codes = { AUTO_EXPOSURE_FULL_AUTO_MODE:           VISCA_AUTO_EXPOSURE_FULL_AUTO,
+                        AUTO_EXPOSURE_MANUAL_MODE:             VISCA_AUTO_EXPOSURE_MANUAL,
+                        AUTO_EXPOSURE_SHUTTER_PRIORITY_MODE:    VISCA_AUTO_EXPOSURE_SHUTTER_PRIORITY,
+                        AUTO_EXPOSURE_IRIS_PRIORITY_MODE:       VISCA_AUTO_EXPOSURE_IRIS_PRIORITY,
+                        AUTO_EXPOSURE_BRIGHT_MODE:              VISCA_AUTO_EXPOSURE_BRIGHT }
+
+        try:
+                __cmd_cam(device, VISCA_AUTO_EXPOSURE, modes2codes[mode])
+        except KeyError:
+                raise ValueError("Invalid AE mode")
+
+
+def set_brightness(device, action):
+        """
+        Set the camera brightness.
+        Must set Auto Exposure mode to bright first!
+        The action performed depends on the value of the second parameter:
+           * If up, increase brightness
+           * If down, decrease brightness
+        """
+        try:
+                if action == BRIGHT_ACTION_UP:
+                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_UP)
+                elif action == BRIGHT_ACTION_DOWN:
+                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_DOWN)
+
+        except ValueError as e:
+                        e.message = "The string {0} or {1} must be passed " \
+                                    "when adjusting the Brightness".format(BRIGHT_ACTION_UP, BRIGHT_ACTION_DOWN)
+                        raise
+
+
+def set_exp_comp(device, action):
+        """
+        Set the camera exposure compensation.
+        The action performed depends on the value of the second parameter:
+           * If up, increase the Exposure Compensation
+           * If down, decrease the Exposure Compensation
+        """
+        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_ON)
+
+        try:
+                if action == EXPOSURE_COMP_ACTION_UP:
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_UP)
+                elif action == EXPOSURE_COMP_ACTION_DOWN:
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_DOWN)
+                elif action == EXPOSURE_COMP_ACTION_RESET:
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_RESET)
+                elif action == EXPOSURE_COMP_ACTION_OFF:
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_OFF)
+
+        except ValueError as e:
+                        e.message = "Select an option {0} {1} {2} or {3}" \
+                                    "when adjusting the Exposure Compensation".format(EXPOSURE_COMP_ACTION_UP,
+                                                                           EXPOSURE_COMP_ACTION_DOWN,
+                                                                           EXPOSURE_COMP_ACTION_RESET,
+                                                                           EXPOSURE_COMP_ACTION_OFF)
+                        raise
 
 
 # Memories
