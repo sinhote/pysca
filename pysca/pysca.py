@@ -27,7 +27,8 @@ import Queue
 
 # Timeout for read and write, in seconds
 # TODO: More timeouts?
-DEFAULT_TIMEOUT=30
+PORT_TIMEOUT = 5
+RESPONSE_TIMEOUT = 30
 
 # This is the default "offset" for the 'set address' command.
 # According to the H-100 documentation, it is always one.
@@ -308,7 +309,7 @@ class Packet(bytes):
 
                 if len(self) < VISCA_MIN_PKG_LEN or \
                    len(self) > VISCA_MAX_PKG_LEN:
-                        raise ValueError("Incorrect packet size")
+                        raise ValueError("Incorrect packet size for '{0}': {1}".format(self, len(self)))
 
                 if ord(self[-1]) != VISCA_TERMINATOR:
                         raise ValueError("Incorrect terminator byte")
@@ -333,13 +334,18 @@ class Packet(bytes):
                 packet=serial.to_bytes([])
 
                 for count in xrange(VISCA_MAX_PKG_LEN):
-                        # Break if there are not bytes to read
-                        if port.inWaiting() == 0:
+                        # Read a new byte
+                        new_byte = port.read(1)
+
+                        # If it is empty, read has returned for timeout
+                        if len(new_byte) == 0:
                                 break
 
-                        packet = packet + port.read(1)
+                        # Otherwise, append the read byte to the packet contents
+                        packet = packet + new_byte
 
-                        if ord(packet[-1]) == VISCA_TERMINATOR:
+                        # Check whether we received a terminator
+                        if ord(new_byte) == VISCA_TERMINATOR:
                                 break
 
                 # The error handling (packet size, packet terminator, etc.) is done on the constructor
@@ -846,7 +852,7 @@ def connect(portname, timeout=None):
         global __alive
 
         # Initialize __timeout
-        __timeout = timeout if timeout else DEFAULT_TIMEOUT
+        __timeout = timeout if timeout else RESPONSE_TIMEOUT
 
         with __port_available:
                 if (__serialport == None):
@@ -854,7 +860,7 @@ def connect(portname, timeout=None):
                                 # Initialize port
                                 __serialport = serial.Serial(portname,\
                                                              VISCA_BAUD_RATE,\
-                                                             timeout=__timeout,\
+                                                             timeout=PORT_TIMEOUT,\
                                                              stopbits=VISCA_STOPBITS,\
                                                              bytesize=VISCA_BYTESIZE)
                                 __serialport.flushInput()
@@ -919,8 +925,8 @@ def init_addresses(first=DEFAULT_SET_ADDR_OFFSET):
 
                 # Wait for the responses to arrive.
                 # The packets are handled by the broadcast receiving loop, but we keep track of the packets received
-                # so that the method does not return until we wait for self.__timeout seconds for a new response.
-                # We assume that if a new packet takes more than self.__timeout seconds to arrive, then no more packets
+                # so that the method does not return until we wait for __timeout seconds for a new response.
+                # We assume that if a new packet takes more than __timeout  seconds to arrive, then no more packets
                 # will arrive, so we return
                 # Even after that, should a new 'set address' packet be received, it would be processed anyway
                 while not __init_addresses_rcvd:
@@ -1030,7 +1036,6 @@ def zoom(device, action, speed=None, focus=None):
         When the second parameter is a fixed zoom position, an optional 'focus' argument
         can be specified, indicating a fixed focus position to set the device to.
         """
-
         # Mechanism to convert the actions accepted by the 'zoom' command into Visca codes
         actions2codes = { ZOOM_ACTION_STOP: lambda speed: VISCA_ZOOM_STOP,
                           ZOOM_ACTION_TELE: lambda speed: VISCA_ZOOM_TELE if speed is None else VISCA_ZOOM_TELE_SPEED | speed,
