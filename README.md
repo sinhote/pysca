@@ -26,6 +26,47 @@ Pysca was developed as a prerequisite to manage Visca devices from [Galicaster](
 #### State of development ####
 **Pysca is currently in an ALPHA state**, so it is not guaranteed to be a complete or stable implementation of the protocol. In particular, it is still lacking most of the control commands, and all the query commands. However, the basic steering and zooming commands are still available.
 
+##### Update 12-January-2017 #####
+
+The synchronization logic has been simplified A LOT, but external API (the command methods) remain unchanged. The only (VERY IMPORTANT) difference is that now all the commands are non-blocking by default. Most commands (except `set_power_on`) accept now a `blocking` parameter at the end of their argument list -- when `blocking` is `True`, the command will block till it is completed (i.e. the old behaviour). `blocking` is now `False` by default -i.e. commands that receive an "ACK" return immediately even though they are not yet finished.
+
+Please note that when a non-blocking command returns, it MIGHT be completed, as long as such command always returns a "COMPLETED" response (and not an ACK) after it is invoked.
+
+However, all the frequently-used PTZ commands (i.e. those that move the camera or change its zoom) return an ACK when they start performing and a "COMPLETED" when they are done. These commands, among others, used to block until they were completed, but now they return immediately.
+
+This means that potentially long-lasting instructions like:
+
+```
+pysca.recall_memory(1, 3)
+```
+
+will NOT be completed when they return, potentially causing the next commands to fail. As an example, the camera (at least the H-100S model) cannot be switched off while there are pending commands executing. Thus, in the following snippet:
+
+```
+pysca.pan_tilt_home(1, blocking=True)
+pysca.pan_tilt(1, pan=1, pan_position=2000, tilt_position=0)
+pysca.set_power_on(1, False)
+```
+
+, the third command will fail because it will be issued when the previous command is still running. However, in:
+
+```
+pysca.pan_tilt_home(1, blocking=True)
+pysca.pan_tilt(1, pan=1, pan_position=2000, tilt_position=0, blocking=True)
+pysca.set_power_on(1, False)
+```
+
+, the second command will block until is completed and therefore the 3rd command will succeed.
+
+In other cases, it may happen that a command is interrupted by another (without raising an error). For instance, in the following snippet:
+
+```
+pysca.pan_tilt(1, pan=7, pan_position=2000, tilt_position=0)
+pysca.pan_tilt(1, tilt=10, pan_position=0, tilt_position=10)
+```
+
+, the second command will interrupt the first immediately when it is issued.
+
 ### Get started ###
 
 #### Access to the serial ports ####
