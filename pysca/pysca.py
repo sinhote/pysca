@@ -446,7 +446,8 @@ class Packet(bytes):
 
         def parse_error(self):
                 """
-                Raise the appropriate exception according to the error sent by the camera
+                Raise the appropriate exception according to the error sent by the camera.
+                If this packet does not represent an error, return the packet itself
                 """
 
                 if self.type == VISCA_RESPONSE_ERROR:
@@ -454,6 +455,7 @@ class Packet(bytes):
                                 raise Packet.__error_map[self.category](self)
                         except KeyError:
                                 raise ViscaUnexpectedResponseError(self)
+                return self
 
         @property
         def header(self):
@@ -498,135 +500,146 @@ class Socket(object):
 
         # Socket status codes
         READY=0
-        BUSY=1
-        CLOSING=2
+        WAITING=1
+        CLEARING=2
 
-        def __init__(self, number=0):
+        def __init__(self, number=0, timeout=None):
                 super(Socket, self).__init__()
                 self.__number = number
                 self.__cond = threading.Condition()
-                self.__packet = None
+                self.packet_sent = None
+                self.packet_received = None
                 self.__status = Socket.READY
+                self.__timeout = timeout
+                self.__waiting = 0
 
-        def get_response(self, timeout = None):
+        def get_response(self, timeout=None):
+                # Make sure there's only one new request at a time
                 with self.__cond:
-                        if self.__status != Socket.READY:
-                                # The socket should be "ready" when we try to read from it
-                                raise ViscaSocketStatusError("Socket {} was not ready for reading, but in status {}"\
-                                                             .format(self.__number, self.__status))
-                        # Mark the socket as busy
-                        self.__status == Socket.BUSY
-                        # Wait for socket to receive the packet
-                        if self.__packet is None:
-                                self.__cond.wait(timeout)
-                        # Mark the socket as READY again
-                        if self.__status == Socket.BUSY:
-                                self.__status = Socket.READY
-                        # If the packet is not set here, the command was cancelled before an answer could be received
-                        # Or the wait() exited for timeout
-                        if self.__packet is None:
-                                raise ViscaTimeoutError()
-                        # Return the packet, but set it to None afterwards
-                        try:
-                                return self.__packet
-                        finally:
-                                self.__packet = None
+                        if timeout is None:
+                                timeout = self.__timeout
+
+                        wait = True
+                        # This will loop at most once, if status is WAITING and wait is True (just the first time)
+                        while self.__status != Socket.READY:
+                                if self.__status == Socket.WAITING:
+                                        if wait:
+                                                self.__waiting += 1
+                                                self.__cond.wait(timeout)
+                                                self.__waiting -= 1
+                                                wait = False
+                                        else:
+                                                raise ViscaTimeoutError("Socket {} did not return an answer after {} seconds".format(self.__number, timeout))
+                                elif self.__status == Socket.CLEARING:
+                                        raise ViscaSocketStatusError("Socket {} is being cleared and can be no longer read"\
+                                                                     .format(self.__number))
+                                else:
+                                        # This shouldn't happen
+                                        raise ViscaSocketStatusError("Socket {} is in the unknown status {}".format(self.__number, self.__status))
+
+                        # Read the socket contents
+                        return self.packet_received
 
         def clear(self):
                 with self.__cond:
-                        if self.__status == Socket.BUSY:
-                                # Awake the thread waiting for a packet and wait for it to exit properly
-                                # When the thread won't find a valid packet, it will raise an exception
-                                # and mark the socket as ready again
-                                while self.__status != Socket.READY:
-                                        # Awake the thread waiting for reading
-                                        self.__cond.notify()
-                                        # TODO Timeout?
-                                        self.__cond.wait()
+                        if self.__waiting > 0:
+                                if self.__status == Socket.READY:
+                                        print "WARNING: Clearing socket {} found {} threads waiting but status was READY".format(self.__number, self.__waiting)
+
+                        # Awake all the waiting threads. After they all fail, return to READY state
+                        self.__status = Socket.CLEARING
+                        while self.__waiting > 0:
+                                # Awake all the threads waiting for reading
+                                self.__cond.notify_all()
+                                # TODO Timeout?
+                                self.__cond.wait()
+
+                        # Reset status to READY and reset the received packet
+                        self.__status = Socket.READY
+                        self.packet_sent = None
+                        self.packet_received = None
+
+        def wait_for_response(self, packet_sent):
+                with self.__cond:
+                        if self.__status == Socket.READY:
+                                self.__status = Socket.WAITING
+                                self.packet_sent = packet_sent
+                                self.packet_received = None
+                        elif self.__status == Socket.WAITING:
+                                raise ViscaSocketStatusError("Tried to block socket {} for packet '{}', but socket was already WAITING response for packet '{}'"\
+                                                             .format(self.__number, packet_sent, self.packet_sent))
+                        else:
+                                raise ViscaSocketStatusError("Tried to block socket {} for packet '{}', but socket was in unexpected status {}"\
+                                                             .format(self.__number, packet_sent, self.__status))
 
         def recv(self, packet):
                 with self.__cond:
                         # Check socket status
-                        if self.__packet is not None:
-                                raise ViscaSocketStatusError("Tried to receive packet {}, but socket {} already had one"\
-                                                             .format(packet, self.__number))
-                        # Make the reception of the packet on this socket
-                        self.__packet = packet
-                        # Signal the packet reception
-                        self.__cond.notify()
+                        if self.__status == Socket.WAITING:
+                                print "Received packet '{}' in socket {}".format(packet, self.__number)
+                                # Make the reception of the packet on this socket
+                                self.packet_received = packet
+                                # Mark socket as READY
+                                self.__status = Socket.READY
+                                # Signal the packet reception
+                                self.__cond.notify_all()
+                        else:
+                                raise ViscaSocketStatusError("Socket {} received packet '{}', but was in unexpected status {}"\
+                                                             .format(self.__number, packet, self.__status))
 
 
 class Device(object):
 
-        # Device statuses
-        READY = 0
-        BUSY = 1
-        FLUSH = 2
-
-        def __init__(self, address, sockets=VISCA_MAX_SOCKETS, timeout=None):
+        def __init__(self, address, send_handler, sockets=VISCA_MAX_SOCKETS, timeout=None):
                 # TODO: Check sockets exceeds maximum? Make it constant?
                 self.address = address
-                self.__timeout = timeout
-                # Create reception sockets (the number 0 is for the ACKs)
-                self.__sockets = [ Socket(i) for i in range(sockets+1) ]
-                # Create a 'Condition' object to allow only one new request at a time
-                self.__request_lock = threading.Condition()
-                # Whether the device is ready to process a new request
-                self.__status = Device.READY
-                # Whether the device is flushing the pending requests
-                self.__clear = False
+                # Lock to ensure the new requests wait until we get a response from the camera
+                self.__send_lock = threading.RLock()
+                # Create reception sockets
+                # Number 0 is for the normal operation.
+                # Numbers 1 and above are for ack'ed commands awaiting for a "completed" response
+                self.__sockets = [ Socket(i, timeout) for i in range(sockets+1) ]
+                # The handler used to send the requests to the device
+                self.__send = send_handler
 
-
-        def block_send(self, timeout=None):
-                # Make sure there's only one new request at a time
-                with self.__request_lock:
-                        if self.__status == Device.READY:
-                                self.__status = Device.BUSY
-                        elif self.__status == Device.BUSY:
-                                raise ViscaDeviceNotReadyError("Device {} is currently serving a request".format(self.address))
-                        elif self.__status == Device.FLUSH:
-                                raise ViscaDeviceNotReadyError("Device {} not ready, probably due to a network reconfiguration".format(self.address))
+        def send(self, *payload, **kwargs):
+                with self.__send_lock:
+                        # Send a command or request to the device
+                        packet = Packet.from_parts(0, self.address, *payload)
+                        self.__sockets[0].wait_for_response(packet)
+                        self.__send(packet)
+                        response = self.__sockets[0].get_response()
+                        if response.type == VISCA_RESPONSE_ACK and kwargs["blocking"]:
+                                return self.__sockets[response.socket].get_response()
                         else:
-                                # This shouldn't happen
-                                raise ViscaDeviceNotReadyError("Device {} is in the unknown status {}".format(self.address, self.__status))
-
-        def unblock_send(self):
-                with self.__request_lock:
-                        if self.__status == Device.BUSY:
-                                self.__status = Device.READY
-                                self.__request_lock.notify()
-                        elif self.__status == Device.READY:
-                                self.__request_lock.notify()
-                        elif self.__status == Device.FLUSH:
-                                raise ViscaDeviceNotReadyError("Device {} is in status {} and cannot be unblocked".format(self.address, self.__status))
-                        else:
-                                # This shouldn't happen
-                                raise ViscaDeviceNotReadyError("Device {} is in the unknown status {}".format(self.address, self.__status))
-
+                                return response
 
         def get_response(self, socket = 0):
                 try:
-                        return self.__sockets[socket].get_response(self.__timeout)
-                finally:
-                        if socket == 0:
-                                with self.__request_lock:
-                                        if self.__status == Device.BUSY:
-                                                self.__status = Device.READY
-                                                self.__request_lock.notify()
-
+                        return self.__sockets[socket].get_response()
+                except KeyError:
+                        raise ViscaNoSuchDeviceError("Tried to read response from a non-existant socket: {}".format(socket))
 
         def recv(self, packet):
-                if packet.type == VISCA_RESPONSE_COMPLETED:
-                        socket = packet.socket
-                else:
-                        socket = 0
+                try:
+                        if packet.type == VISCA_RESPONSE_COMPLETED:
+                                self.__sockets[packet.socket].recv(packet)
+                        else:
+                                if packet.type == VISCA_RESPONSE_ACK:
+                                        # Mark the corresponding socket to wait for the "COMPLETED" packet
+                                        self.__sockets[packet.socket].wait_for_response(self.__sockets[0].packet_sent)
 
-                self.__sockets[socket].recv(packet)
-
+                                # Signal the reception in the "main" socket (socket 0)
+                                self.__sockets[0].recv(packet)
+                except KeyError:
+                        raise ViscaNoSuchDeviceError("Tried to register a response in a non-existant socket: {}".format(packet.socket))
 
         def clear(self):
-                # Block new requests during the "clear" process
-                with self.__request_lock:
+                # This is why we used a reentrant lock
+                # When clearing the device, we use this lock twice to avoid new requests to go on while the "sockets" are being cleared
+                with self.__send_lock:
+                        # Send the "clear" packet
+                        response = self.send(VISCA_IF_CLEAR_PAYLOAD)
                         # Create one thread per socket
                         threads = [ threading.Thread(target=socket.clear()) for socket in self.__sockets ]
                         # Run the threads in parallel
@@ -635,23 +648,6 @@ class Device(object):
                         # Wait for the threads to finish
                         for t in threads:
                                 t.join()
-
-                        # Let new requests in
-                        if self.__status == Device.BUSY:
-                                self.__status = Device.READY
-                                self.__request_lock.notify()
-
-        def flush(self):
-                # Block new requests during the flush process
-                with self.__request_lock:
-                        self.__status = Device.FLUSH
-                        self.clear()
-
-
-        def set_ready(self):
-                # Make the device ready again
-                with self.__request_lock:
-                        self.__status = Device.READY
 
 
 __serialport=None
@@ -692,7 +688,7 @@ def __reader():
                         # Read the packet
                         #print "__READER READ PACKET"
                         p = Packet.from_serial(__serialport)
-                        print "Received packet:", p
+                        #print "Received packet:", p
 
                         # Check the response according to several types
                         if p.header == VISCA_BCAST_HEADER:
@@ -741,7 +737,7 @@ def __bcast_reader():
                         with __init_addresses_lock:
                                 new_addr = ord(packet[2]) - __init_addresses_offset
                                 if new_addr not in __devices:
-                                        __devices[new_addr] = Device(new_addr, timeout=__timeout)
+                                        __devices[new_addr] = Device(new_addr, __write_to_serial, timeout=__timeout)
                                 else:
                                         # TODO: Use logger
                                         # TODO: Any other measures?
@@ -771,59 +767,6 @@ def __write_to_serial(packet):
                         print "ERROR: Port is not open when writing"
                         # TODO: Gracefully signal all threads to stop
                         raise ViscaError(e)
-
-
-def __get_response(device, socket = 0):
-        try:
-                # Read the response
-                return __devices[device].get_response(socket)
-        except KeyError:
-                raise ViscaNoSuchDeviceError("Tried to receive a packet from the non-existant device {}".format(recipient))
-
-
-def __send(recipient, *payload):
-        # print "__SEND"
-        try:
-                # Relay the request to the corresponding "device"
-                request = Packet.from_parts(0, recipient, *payload)
-
-                print "Sending packet {}".format(request)
-
-                # Only one request at a time: block till the device allows us to go
-                __devices[recipient].block_send()
-
-                # Write the request in the serial port
-                __write_to_serial(request)
-
-                # Wait for a response from the device
-                response = __devices[recipient].get_response()
-
-                if response.type == VISCA_RESPONSE_ACK:
-                        # Wait for the ACK
-                        # TODO Is this check really necessary?
-                        if response.socket > 0:
-                                response = __get_response(recipient, response.socket)
-                        else:
-                                raise ViscaUnexpectedResponseError("Received ACK response with no socket specified")
-
-                if response.type != VISCA_RESPONSE_COMPLETED:
-                        # Raise an exception if we got a standard error
-                        response.parse_error()
-
-                        # Reach this if the previous function didn't raise a "standard" exception
-                        raise ViscaUnexpectedResponseError("Received response {}. 'completed' expected".format(reply))
-
-        except KeyError:
-                raise ViscaNoSuchDeviceError("Tried to send a packet to the non-existant device {}".format(recipient))
-
-
-def __flush_all():
-        # TODO: Exceptions?
-        ths = [ threading.Thread(target=__devices[i].flush) for i in __devices ]
-        for t in ths:
-                t.start()
-        for t in ths:
-                t.join()
 
 
 def __clear_all():
@@ -915,7 +858,7 @@ def init_addresses(first=DEFAULT_SET_ADDR_OFFSET):
                         __init_addresses_rcvd = False
 
                 # Flush the pending commands
-                __flush_all()
+                __clear_all()
 
                 # Send the address set request
                 __write_to_serial(Packet.from_parts(0, VISCA_BCAST_ADDR, VISCA_ADDR, first))
@@ -950,7 +893,7 @@ def init_addresses(first=DEFAULT_SET_ADDR_OFFSET):
 
 def clear_all():
         """
-        Cancels the ongoing commands and cleans the command buffers for all the connected devices
+        Cleans the command buffers for all the connected devices
         """
 
         global __if_clear_rcvd
@@ -982,13 +925,13 @@ def clear_all():
 
 def clear_commands(dest):
         """
-        Cancels the ongoing commands and cleans the command buffers
+        Clean the command buffers
         The destination may be the broadcast address (8), in which case, all the connected devices will be cleared
         """
         if dest == VISCA_BCAST_ADDR:
                 clear_all()
         else:
-                __send(dest, VISCA_IF_CLEAR_PAYLOAD)
+                __devices[dest].send(VISCA_IF_CLEAR_PAYLOAD)
                 try:
                         __devices[i].clear()
                 except KeyError:
@@ -997,11 +940,11 @@ def clear_commands(dest):
                         pass
 
 
-def __cmd_cam(device, *parts):
-        __send(device, VISCA_COMMAND, VISCA_CATEGORY_CAMERA, *parts)
+def __cmd_cam(device, *parts, **kwargs):
+        return __devices[device].send(VISCA_COMMAND, VISCA_CATEGORY_CAMERA, *parts, **kwargs).parse_error()
 
-def __cmd_pt(device, *parts):
-        __send(device, VISCA_COMMAND, VISCA_CATEGORY_PAN_TILTER, *parts)
+def __cmd_pt(device, *parts, **kwargs):
+        return __devices[device].send(VISCA_COMMAND, VISCA_CATEGORY_PAN_TILTER, *parts, **kwargs).parse_error()
 
 
 # POWER control
@@ -1013,15 +956,15 @@ def set_power_on(device, on):
         * If it is False, try to set the camera off.
         """
         if on:
-                __cmd_cam(device, VISCA_POWER, VISCA_POWER_ON)
+                __cmd_cam(device, VISCA_POWER, VISCA_POWER_ON, blocking=True)
         else:
-                __cmd_cam(device, VISCA_POWER, VISCA_POWER_OFF)
+                __cmd_cam(device, VISCA_POWER, VISCA_POWER_OFF, blocking=True)
 
 
 ################
 # ZOOM control #
 ################
-def zoom(device, action, speed=None, focus=None):
+def zoom(device, action, speed=None, focus=None, blocking=False):
         """
         Zoom the camera in or out.
         The second parameter may take any of the following forms:
@@ -1059,18 +1002,18 @@ def zoom(device, action, speed=None, focus=None):
                         raise
 
         try:
-                __cmd_cam(device, VISCA_ZOOM, actions2codes[action](speed))
+                __cmd_cam(device, VISCA_ZOOM, actions2codes[action](speed), blocking=blocking)
         except KeyError:
                 # 'action' must not be a known action (i.e. is not a key in the 'actions2codes' dictionary), but an absolute zoom position
                 # This will raise an exception if action cannot be converted to an integer
                 if focus is None:
-                        __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(action, 4))
+                        __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(action, 4), blocking=blocking)
                 else:
                         # Use the operation that sets up the focus and the zoom at the same time
-                        __cmd_cam(device, VISCA_FOCUS_VALUE, Packet.int_to_bytes(action, 4), Packet.int_to_bytes(focus, 4))
+                        __cmd_cam(device, VISCA_FOCUS_VALUE, Packet.int_to_bytes(action, 4), Packet.int_to_bytes(focus, 4), blocking=blocking)
 
 
-def set_zoom(device, zoom, focus = None):
+def set_zoom(device, zoom, focus = None, blocking = False):
         """
         Sets the zoom to a fixed position.
         The 'zoom' argument is a 4-byte integer. The possible values and their meaning can be consulted in the
@@ -1079,14 +1022,14 @@ def set_zoom(device, zoom, focus = None):
         'focus' should be a 4-byte integer, its acceptable values and their meaning to be found at the device's manual.
         """
         if focus is None:
-                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4))
+                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4), blocking=blocking)
         else:
                 # Sets focus and zoom at the same time
-                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4), Packet.int_to_bytes(focus, 4))
+                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4), Packet.int_to_bytes(focus, 4), blocking=blocking)
 
 
 #Digital Zoom control on/off
-def set_digital_zoom(device, on=True):
+def set_digital_zoom(device, on=True, blocking=False):
         """
         Set the digital zoom on and off.
         The action performed depends on the parameter "on".
@@ -1094,12 +1037,12 @@ def set_digital_zoom(device, on=True):
            * If it is False, deactivate the digital zoom.
         """
         if on:
-                __cmd_cam(device, VISCA_DZOOM, VISCA_DZOOM_ON)
+                __cmd_cam(device, VISCA_DZOOM, VISCA_DZOOM_ON, blocking=blocking)
         else:
-                __cmd_cam(device, VISCA_DZOOM, VISCA_DZOOM_OFF)
+                __cmd_cam(device, VISCA_DZOOM, VISCA_DZOOM_OFF, blocking=blocking)
 
 
-def focus(device, action, speed=None, zoom=None):
+def focus(device, action, speed=None, zoom=None, blocking=False):
         """
         Changes camera focus.
         The second parameter may take any of the following forms:
@@ -1137,13 +1080,13 @@ def focus(device, action, speed=None, zoom=None):
                         raise
 
         try:
-                __cmd_cam(device, VISCA_FOCUS, actions2codes[action](speed))
+                __cmd_cam(device, VISCA_FOCUS, actions2codes[action](speed), blocking=blocking)
         except KeyError:
                 # 'action' is not be a known action (i.e. is not a key in the 'actions2codes' dictionary)
                 raise ValueError("'{}' is not a valid focus action".format(action))
 
 
-def set_focus(device, focus, zoom = None):
+def set_focus(device, focus, zoom = None, blocking=False):
         """
         Sets the focus to a fixed position.
         The 'focus' argument is a 4-byte integer. The possible values and their meaning can be consulted in the
@@ -1152,22 +1095,22 @@ def set_focus(device, focus, zoom = None):
         'zoom' should be a 4-byte integer, its acceptable values and their meaning to be found at the device's manual.
         """
         if zoom is None:
-                __cmd_cam(device, VISCA_FOCUS_VALUE, Packet.int_to_bytes(focus, 4))
+                __cmd_cam(device, VISCA_FOCUS_VALUE, Packet.int_to_bytes(focus, 4), blocking=blocking)
         else:
                 # Sets focus and zoom at the same time
-                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4), Packet.int_to_bytes(focus, 4))
+                __cmd_cam(device, VISCA_ZOOM_VALUE, Packet.int_to_bytes(zoom, 4), Packet.int_to_bytes(focus, 4), blocking=blocking)
 
 
-def set_near_limit(device, limit):
+def set_near_limit(device, limit, blocking=False):
         """
         Set the camera's focus "near limit", i.e. the shortest distance an object can get the focus from the camera.
         The second parameter is a four-byte integer that indicates the near-limit distance.
         Please check the camera manual to see the valid values and their distance equivalence.
         """
-        __cmd_cam(device, VISCA_FOCUS_NEAR_LIMIT, Packet.int_to_bytes(limit, 4))
+        __cmd_cam(device, VISCA_FOCUS_NEAR_LIMIT, Packet.int_to_bytes(limit, 4), blocking=blocking)
 
 
-def set_focus_mode(device, mode = None):
+def set_focus_mode(device, mode = None, blocking=False):
         """
         Set the focus mode.
         The mode can take any of the following values:
@@ -1187,12 +1130,12 @@ def set_focus_mode(device, mode = None):
                         FOCUS_TRIGGER_MODE_INFINITY: (VISCA_FOCUS_TRIGGER, VISCA_FOCUS_TRIGGER_INFINITY) }
 
         try:
-                __cmd_cam(device, *modes2codes[mode])
+                __cmd_cam(device, *modes2codes[mode], blocking=blocking)
         except KeyError:
                 raise ValueError("'{}' is not a valid focus mode".format(mode))
 
 
-def set_autofocus_low_sensitivity(device, sensitive=True):
+def set_autofocus_low_sensitivity(device, sensitive=True, blocking=False):
         """
         Set the autofocus low sensitivity mode.
         The action performed depends on the second parameter:
@@ -1200,12 +1143,12 @@ def set_autofocus_low_sensitivity(device, sensitive=True):
            * If it is False, set the autofocus sensitivity to 'normal'
         """
         if sensitive:
-                __cmd_cam(device, VISCA_FOCUS_AUTO_SENSE, VISCA_FOCUS_AUTO_SENSE_LOW)
+                __cmd_cam(device, VISCA_FOCUS_AUTO_SENSE, VISCA_FOCUS_AUTO_SENSE_LOW, blocking=blocking)
         else:
-                __cmd_cam(device, VISCA_FOCUS_AUTO_SENSE, VISCA_FOCUS_AUTO_SENSE_HIGH)
+                __cmd_cam(device, VISCA_FOCUS_AUTO_SENSE, VISCA_FOCUS_AUTO_SENSE_HIGH, blocking=blocking)
 
 
-def set_autofocus_mode(device, mode):
+def set_autofocus_mode(device, mode, blocking=False):
         """
         Set the autofocus movement mode
         The action performed depends on the value of the second paramenter:
@@ -1220,21 +1163,21 @@ def set_autofocus_mode(device, mode):
                         FOCUS_AUTO_MOV_MODE_INTERVAL: VISCA_FOCUS_AUTO_MOV_INTERVAL }
 
         try:
-                __cmd_cam(device, VISCA_FOCUS_AUTO_MOV, modes2codes[mode])
+                __cmd_cam(device, VISCA_FOCUS_AUTO_MOV, modes2codes[mode], blocking=blocking)
         except KeyError:
                 raise ValueError("'{}' si not a valid autofocus movement mode".format(mode))
 
 
-def set_autofocus_active_interval(device, active, interval):
+def set_autofocus_active_interval(device, active, interval, blocking=False):
         """
         Set the autofocus 'active' and 'interval' parameters.
         These parameters are relevant for some autofocus modes.
         Both parameters have to be integers between 0x00 and 0xFF
         """
-        __cmd_cam(device, VISCA_FOCUS_AUTO_ACTIVE_INT, Packet.int_to_bytes(active,2), Packet.int_to_bytes(interval,2))
+        __cmd_cam(device, VISCA_FOCUS_AUTO_ACTIVE_INT, Packet.int_to_bytes(active,2), Packet.int_to_bytes(interval,2), blocking=blocking)
 
 
-def set_ir_correction(device, activate):
+def set_ir_correction(device, activate, blocking=False):
         """
         Set the camera correction for IR light.
         The action performed depends on the value of the second parameter:
@@ -1242,12 +1185,12 @@ def set_ir_correction(device, activate):
            * If False, deactivate the IR correction
         """
         if activate:
-                __cmd_cam(device, VISCA_IR_CORRECTION, VISCA_IR_CORRECTION_ON)
+                __cmd_cam(device, VISCA_IR_CORRECTION, VISCA_IR_CORRECTION_ON, blocking=blocking)
         else:
-                __cmd_cam(device, VISCA_IR_CORRECTION, VISCA_IR_CORRECTION_OFF)
+                __cmd_cam(device, VISCA_IR_CORRECTION, VISCA_IR_CORRECTION_OFF, blocking=blocking)
 
 
-def set_wb_mode(device, mode):
+def set_wb_mode(device, mode, blocking=False):
         """
         Set the white balance mode.
 
@@ -1262,29 +1205,29 @@ def set_wb_mode(device, mode):
                         WB_MANUAL_MODE:  VISCA_WB_MANUAL }
 
         try:
-                __cmd_cam(device, VISCA_WB, modes2codes[mode])
+                __cmd_cam(device, VISCA_WB, modes2codes[mode], blocking=blocking)
         except KeyError:
                 raise ValueError("Invalid WB mode")
 
 
-def trigger_wb(device):
+def trigger_wb(device, blocking=False):
         """
         Trigger the "one push" white balance, when it is set.
 
         This command makes the camera perform a white balance, when the "one push" WB mode is set
         """
-        __cmd_cam(device, VISCA_WB_TRIGGER, VISCA_WB_TRIGGER_ONEPUSH)
+        __cmd_cam(device, VISCA_WB_TRIGGER, VISCA_WB_TRIGGER_ONEPUSH, blocking=blocking)
 
 
-def set_red_gain(device, action):
+def set_red_gain(device, action, blocking=False):
         raise NotImplementedError()
 
 
-def set_blue_gain(device, action):
+def set_blue_gain(device, action, blocking=False):
         raise NotImplementedError()
 
 
-def set_ae_mode(device, mode):
+def set_ae_mode(device, mode, blocking=False):
         """
         Set the auto exposure mode.
 
@@ -1299,12 +1242,12 @@ def set_ae_mode(device, mode):
                         AUTO_EXPOSURE_BRIGHT_MODE:              VISCA_AUTO_EXPOSURE_BRIGHT }
 
         try:
-                __cmd_cam(device, VISCA_AUTO_EXPOSURE, modes2codes[mode])
+                __cmd_cam(device, VISCA_AUTO_EXPOSURE, modes2codes[mode], blocking=blocking)
         except KeyError:
                 raise ValueError("Invalid AE mode")
 
 
-def set_brightness(device, action):
+def set_brightness(device, action, blocking=False):
         """
         Set the camera brightness.
         Must set Auto Exposure mode to bright first!
@@ -1314,9 +1257,9 @@ def set_brightness(device, action):
         """
         try:
                 if action == BRIGHT_ACTION_UP:
-                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_UP)
+                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_UP, blocking=blocking)
                 elif action == BRIGHT_ACTION_DOWN:
-                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_DOWN)
+                        __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_DOWN, blocking=blocking)
 
         except ValueError as e:
                         e.message = "The string {0} or {1} must be passed " \
@@ -1324,24 +1267,24 @@ def set_brightness(device, action):
                         raise
 
 
-def set_exp_comp(device, action):
+def set_exp_comp(device, action, blocking=False):
         """
         Set the camera exposure compensation.
         The action performed depends on the value of the second parameter:
            * If up, increase the Exposure Compensation
            * If down, decrease the Exposure Compensation
         """
-        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_ON)
+        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_ON, blocking=blocking)
 
         try:
                 if action == EXPOSURE_COMP_ACTION_UP:
-                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_UP)
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_UP, blocking=blocking)
                 elif action == EXPOSURE_COMP_ACTION_DOWN:
-                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_DOWN)
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_DOWN, blocking=blocking)
                 elif action == EXPOSURE_COMP_ACTION_RESET:
-                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_RESET)
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP_AMOUNT, VISCA_EXPOSURE_COMP_RESET, blocking=blocking)
                 elif action == EXPOSURE_COMP_ACTION_OFF:
-                        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_OFF)
+                        __cmd_cam(device, VISCA_EXPOSURE_COMP, VISCA_EXPOSURE_COMP_OFF, blocking=blocking)
 
         except ValueError as e:
                         e.message = "Select an option {0} {1} {2} or {3}" \
@@ -1353,7 +1296,7 @@ def set_exp_comp(device, action):
 
 
 # Memories
-def reset_memory(device, position):
+def reset_memory(device, position, blocking=False):
         """
         Reset a memory position.
         Memories store specific camera configurations and positions.
@@ -1365,10 +1308,10 @@ def reset_memory(device, position):
         if position not in range(MAX_MEMORY_POSITIONS):
                 raise ValueError("Invalid memory position: {}".format(position))
 
-        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RESET, position)
+        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RESET, position, blocking=blocking)
 
 
-def set_memory(device, position):
+def set_memory(device, position, blocking=False):
         """
         Set a memory position with the current configuration and position.
 
@@ -1379,10 +1322,10 @@ def set_memory(device, position):
         if position not in range(MAX_MEMORY_POSITIONS):
                 raise ValueError("Invalid memory position: {}".format(position))
 
-        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_SET, position)
+        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_SET, position, blocking=blocking)
 
 
-def recall_memory(device, position):
+def recall_memory(device, position, blocking=False):
         """
         Recall a memory position.
         Memories store specific camera configurations and positions.
@@ -1394,11 +1337,11 @@ def recall_memory(device, position):
         if position not in range(MAX_MEMORY_POSITIONS):
                 raise ValueError("Invalid memory position: {}".format(position))
 
-        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RECALL, position)
+        __cmd_cam(device, VISCA_MEMORY, VISCA_MEMORY_RECALL, position, blocking=blocking)
 
 
 # Pan and Tilt Drive:
-def pan_tilt(device, pan=None, tilt=None, pan_position=None, tilt_position=None, relative=False):
+def pan_tilt(device, pan=None, tilt=None, pan_position=None, tilt_position=None, relative=False, blocking=False):
         """
         Specify a pan/tilt movement with the camera.
            * 'pan' indicates the speed of the horizontal movement. It can be positive or negative, so that:
@@ -1465,25 +1408,25 @@ def pan_tilt(device, pan=None, tilt=None, pan_position=None, tilt_position=None,
         if pan_position is not None and tilt_position is not None:
                 if relative:
                         __cmd_pt(device, VISCA_PT_RELATIVE_POSITION, abs(int(pan)), abs(int(tilt)),\
-                                      Packet.int_to_bytes(pan_position, 4), Packet.int_to_bytes(tilt_position, 4))
+                                      Packet.int_to_bytes(pan_position, 4), Packet.int_to_bytes(tilt_position, 4), blocking=blocking)
                 else:
                         __cmd_pt(device, VISCA_PT_ABSOLUTE_POSITION, abs(int(pan)), abs(int(tilt)),\
-                                      Packet.int_to_bytes(pan_position, 4), Packet.int_to_bytes(tilt_position, 4))
+                                      Packet.int_to_bytes(pan_position, 4), Packet.int_to_bytes(tilt_position, 4), blocking=blocking)
         elif pan_position is None and tilt_position is None:
-                __cmd_pt(device, VISCA_PT_DRIVE, abs(int(pan)), abs(int(tilt)), horiz, vert)
+                __cmd_pt(device, VISCA_PT_DRIVE, abs(int(pan)), abs(int(tilt)), horiz, vert, blocking=blocking)
         else:
                 raise ValueError("Both arguments 'tilt_position' and 'pan_position' must be present or absent at the same time")
 
 
-def pan_tilt_home(device):
+def pan_tilt_home(device, blocking=False):
         """
         Move the camera to its "home" position
         """
-        __cmd_pt(device, VISCA_PT_HOME)
+        __cmd_pt(device, VISCA_PT_HOME, blocking=blocking)
 
 
-def pan_tilt_reset(device):
+def pan_tilt_reset(device, blocking=False):
         """
         Force the device to recalibrate the pan-tilt position.
         """
-        __cmd_pt(device, VISCA_PT_RESET)
+        __cmd_pt(device, VISCA_PT_RESET, blocking=blocking)
