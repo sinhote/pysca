@@ -1267,11 +1267,12 @@ def set_brightness(device, action, blocking=False):
                         __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_UP, blocking=blocking)
                 elif action == BRIGHT_ACTION_DOWN:
                         __cmd_cam(device, VISCA_BRIGHT, VISCA_BRIGHT_DOWN, blocking=blocking)
+                else:
+                        __cmd_cam(device, VISCA_BRIGHT_VALUE, serial.to_bytes("\x00\x00"), Packet.int_to_bytes(action, 2), blocking=blocking)
 
-        except ValueError as e:
-                        e.message = "The string {0} or {1} must be passed " \
-                                    "when adjusting the Brightness".format(BRIGHT_ACTION_UP, BRIGHT_ACTION_DOWN)
-                        raise
+        except ValueError:
+                        raise ValueError("The string '{0}', '{1}' or a one-byte-long integer must be passed " \
+                                    "when adjusting the Brightness".format(BRIGHT_ACTION_UP, BRIGHT_ACTION_DOWN))
 
 
 def set_exp_comp(device, action, blocking=False):
