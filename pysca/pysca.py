@@ -580,7 +580,7 @@ class Socket(object):
                 with self.__cond:
                         # Check socket status
                         if self.__status == Socket.WAITING:
-                                print "Received packet '{}' in socket {}".format(packet, self.__number)
+                                #print "Received packet '{}' in socket {}".format(packet, self.__number)
                                 # Make the reception of the packet on this socket
                                 self.packet_received = packet
                                 # Mark socket as READY
